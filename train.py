@@ -7,8 +7,8 @@ import time
 import numpy as np
 import torch.distributed as dist
 import torch.utils.data.distributed
-from apex import amp
-from apex.parallel import DistributedDataParallel
+# from apex import amp
+# from apex.parallel import DistributedDataParallel
 from warpctc_pytorch import CTCLoss
 
 from data.data_loader import AudioDataLoader, SpectrogramDataset, BucketingSampler, DistributedBucketingSampler
@@ -113,7 +113,6 @@ if __name__ == '__main__':
 
     # Set seeds for determinism
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
@@ -209,12 +208,8 @@ if __name__ == '__main__':
     if optim_state is not None:
         optimizer.load_state_dict(optim_state)
 
-    model, optimizer = amp.initialize(model, optimizer,
-                                      opt_level=args.opt_level,
-                                      keep_batchnorm_fp32=args.keep_batchnorm_fp32,
-                                      loss_scale=args.loss_scale)
-    if args.distributed:
-        model = DistributedDataParallel(model)
+    # if args.distributed:
+    #     model = DistributedDataParallel(model)
     print(model)
     print("Number of parameters: %d" % DeepSpeech.get_param_size(model))
 
@@ -254,9 +249,7 @@ if __name__ == '__main__':
             if valid_loss:
                 optimizer.zero_grad()
                 # compute gradient
-
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
                 optimizer.step()
             else:
