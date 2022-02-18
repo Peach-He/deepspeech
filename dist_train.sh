@@ -1,15 +1,16 @@
-python -m intel_extension_for_pytorch.cpu.launch train.py \
+python -m intel_extension_for_pytorch.cpu.launch --distributed --nproc_per_node=2 --nnodes=1 --hostfile sr113 train.py \
     --rnn-type lstm \
-    --hidden-size 256 \
-    --hidden-layers 2  \
+    --hidden-size 512 \
+    --hidden-layers 4  \
     --train-manifest /mnt/sdd/LibriSpeech/LibriSpeech-ds/manifests/train_clean_100_manifest.csv \
     --val-manifest /mnt/sdd/LibriSpeech/LibriSpeech-ds/manifests/dev_clean_manifest.csv \
     --epochs 60 \
     --num-workers 4 \
     --learning-anneal 1.01 \
-    --batch-size 8 \
+    --batch-size 16 \
     --no-sortaGrad \
     --id libri \
     --checkpoint \
     --save-folder deepspeech.pytorch/librispeech/ \
-    --model-path deepspeech.pytorch/librispeech/deepspeech_final.pth
+    --model-path deepspeech.pytorch/librispeech/deepspeech_final.pth \
+    --distributed

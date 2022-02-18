@@ -6,7 +6,7 @@ from model import DeepSpeech
 
 def reduce_tensor(tensor, world_size, reduce_op_max=False):
     rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.MAX if reduce_op_max is True else dist.reduce_op.SUM)  # Default to sum
+    dist.all_reduce(rt, op=dist.ReduceOp.MAX if reduce_op_max is True else dist.ReduceOp.SUM)  # Default to sum
     if not reduce_op_max:
         rt /= world_size
     return rt
@@ -31,10 +31,7 @@ def check_loss(loss, loss_value):
     return loss_valid, error
 
 
-def load_model(device, model_path, use_half):
+def load_model(model_path):
     model = DeepSpeech.load_model(model_path)
     model.eval()
-    model = model.to(device)
-    if use_half:
-        model = model.half()
     return model

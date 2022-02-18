@@ -5,10 +5,10 @@ import random
 import time
 
 import numpy as np
+from sqlalchemy import true
+import torch
 import torch.distributed as dist
 import torch.utils.data.distributed
-# from apex import amp
-# from apex.parallel import DistributedDataParallel
 from warpctc_pytorch import CTCLoss
 
 from data.data_loader import AudioDataLoader, SpectrogramDataset, BucketingSampler, DistributedBucketingSampler
@@ -17,6 +17,7 @@ from logger import VisdomLogger, TensorBoardLogger
 from model import DeepSpeech, supported_rnns
 from test import evaluate
 from utils import reduce_tensor, check_loss
+import extend_distributed as ext_dist
 
 parser = argparse.ArgumentParser(description='DeepSpeech training')
 parser.add_argument('--train-manifest', metavar='DIR',
@@ -67,11 +68,9 @@ parser.add_argument('--no-sortaGrad', dest='no_sorta_grad', action='store_true',
                     help='Turn off ordering of dataset on sequence length for the first epoch.')
 parser.add_argument('--no-bidirectional', dest='bidirectional', action='store_false', default=True,
                     help='Turn off bi-directional RNNs, introduces lookahead convolution')
-parser.add_argument('--dist-url', default='tcp://127.0.0.1:1550', type=str,
-                    help='url used to set up distributed training')
-parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
-parser.add_argument('--world-size', default=1, type=int,
-                    help='number of distributed processes')
+parser.add_argument('--dist-backend', default='ccl', type=str, help='distributed backend')
+parser.add_argument('--distributed', action='store_true', default=False,
+                    help='Enable distributed training')
 parser.add_argument('--rank', default=0, type=int,
                     help='The rank of this process')
 parser.add_argument('--gpu-rank', default=None,
@@ -81,8 +80,6 @@ parser.add_argument('--opt-level', type=str)
 parser.add_argument('--keep-batchnorm-fp32', type=str, default=None)
 parser.add_argument('--loss-scale', type=str, default=None)
 
-torch.manual_seed(123456)
-torch.cuda.manual_seed_all(123456)
 
 
 def to_np(x):
@@ -116,16 +113,11 @@ if __name__ == '__main__':
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    device = torch.device("cuda" if args.cuda else "cpu")
-    args.distributed = args.world_size > 1
     main_proc = True
-    device = torch.device("cuda" if args.cuda else "cpu")
     if args.distributed:
-        if args.gpu_rank:
-            torch.cuda.set_device(int(args.gpu_rank))
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
-        main_proc = args.rank == 0  # Only the first proc should save models
+        ext_dist.init_distributed(backend=args.dist_backend)
+        main_proc = ext_dist.my_rank == 0  # Only the first proc should save models
+        print(f'rank: {ext_dist.my_rank}')
     save_folder = args.save_folder
     os.makedirs(save_folder, exist_ok=True)  # Ensure save folder exists
 
@@ -191,25 +183,27 @@ if __name__ == '__main__':
         train_sampler = BucketingSampler(train_dataset, batch_size=args.batch_size)
     else:
         train_sampler = DistributedBucketingSampler(train_dataset, batch_size=args.batch_size,
-                                                    num_replicas=args.world_size, rank=args.rank)
+                                                    num_replicas=ext_dist.my_size, rank=ext_dist.my_rank)
     train_loader = AudioDataLoader(train_dataset,
                                    num_workers=args.num_workers, batch_sampler=train_sampler)
     test_loader = AudioDataLoader(test_dataset, batch_size=args.batch_size,
                                   num_workers=args.num_workers)
 
+    if main_proc:
+        print(f'train sample length: {len(train_loader)}')
+        print(f'eval sample length: {len(test_loader)}')
     if (not args.no_shuffle and start_epoch != 0) or args.no_sorta_grad:
         print("Shuffling batches for the following epochs")
         train_sampler.shuffle(start_epoch)
 
-    model = model.to(device)
     parameters = model.parameters()
     optimizer = torch.optim.SGD(parameters, lr=args.lr,
                                 momentum=args.momentum, nesterov=True, weight_decay=1e-5)
     if optim_state is not None:
         optimizer.load_state_dict(optim_state)
 
-    # if args.distributed:
-    #     model = DistributedDataParallel(model)
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model)
     print(model)
     print("Number of parameters: %d" % DeepSpeech.get_param_size(model))
 
@@ -217,122 +211,128 @@ if __name__ == '__main__':
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    bw_time = AverageMeter()
 
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        end = time.time()
-        start_epoch_time = time.time()
-        for i, (data) in enumerate(train_loader, start=start_iter):
-            if i == len(train_sampler):
-                break
-            inputs, targets, input_percentages, target_sizes = data
-            input_sizes = input_percentages.mul_(int(inputs.size(3))).int()
-            # measure data loading time
-            data_time.update(time.time() - end)
-            inputs = inputs.to(device)
-
-            out, output_sizes = model(inputs, input_sizes)
-            out = out.transpose(0, 1)  # TxNxH
-
-            float_out = out.float()  # ensure float32 for loss
-            loss = criterion(float_out, targets, output_sizes, target_sizes).to(device)
-            loss = loss / inputs.size(0)  # average the loss by minibatch
-
-            if args.distributed:
-                loss = loss.to(device)
-                loss_value = reduce_tensor(loss, args.world_size).item()
-            else:
-                loss_value = loss.item()
-
-            # Check to ensure valid loss was calculated
-            valid_loss, error = check_loss(loss, loss_value)
-            if valid_loss:
-                optimizer.zero_grad()
-                # compute gradient
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
-                optimizer.step()
-            else:
-                print(error)
-                print('Skipping grad update')
-                loss_value = 0
-
-            avg_loss += loss_value
-            losses.update(loss_value, inputs.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=2, active=2, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./trace'),
+        with_modules=True) as prof:
+        for epoch in range(start_epoch, args.epochs):
+            model.train()
             end = time.time()
-            if not args.silent:
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-                    (epoch + 1), (i + 1), len(train_sampler), batch_time=batch_time, data_time=data_time, loss=losses))
-            if args.checkpoint_per_batch > 0 and i > 0 and (i + 1) % args.checkpoint_per_batch == 0 and main_proc:
-                file_path = '%s/deepspeech_checkpoint_epoch_%d_iter_%d.pth' % (save_folder, epoch + 1, i + 1)
-                print("Saving checkpoint model to %s" % file_path)
-                torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, iteration=i,
-                                                loss_results=loss_results,
-                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss),
-                           file_path)
-            del loss, out, float_out
+            start_epoch_time = time.time()
+            for i, (data) in enumerate(train_loader, start=start_iter):
+                if i == len(train_sampler):
+                    break
+                inputs, targets, input_percentages, target_sizes = data
+                input_sizes = input_percentages.mul_(int(inputs.size(3))).int()
+                # measure data loading time
+                data_time.update(time.time() - end)
 
-        avg_loss /= len(train_sampler)
+                out, output_sizes = model(inputs, input_sizes)
+                out = out.transpose(0, 1)  # TxNxH
 
-        epoch_time = time.time() - start_epoch_time
-        print('Training Summary Epoch: [{0}]\t'
-              'Time taken (s): {epoch_time:.0f}\t'
-              'Average Loss {loss:.3f}\t'.format(epoch + 1, epoch_time=epoch_time, loss=avg_loss))
+                float_out = out.float()  # ensure float32 for loss
+                loss = criterion(float_out, targets, output_sizes, target_sizes)
+                loss = loss / inputs.size(0)  # average the loss by minibatch
 
-        start_iter = 0  # Reset start iteration for next epoch
-        with torch.no_grad():
-            wer, cer, output_data = evaluate(test_loader=test_loader,
-                                             device=device,
-                                             model=model,
-                                             decoder=decoder,
-                                             target_decoder=decoder)
-        loss_results[epoch] = avg_loss
-        wer_results[epoch] = wer
-        cer_results[epoch] = cer
-        print('Validation Summary Epoch: [{0}]\t'
-              'Average WER {wer:.3f}\t'
-              'Average CER {cer:.3f}\t'.format(
-            epoch + 1, wer=wer, cer=cer))
+                if args.distributed:
+                    loss_value = reduce_tensor(loss, ext_dist.my_size).item()
+                else:
+                    loss_value = loss.item()
 
-        values = {
-            'loss_results': loss_results,
-            'cer_results': cer_results,
-            'wer_results': wer_results
-        }
-        if args.visdom and main_proc:
-            visdom_logger.update(epoch, values)
-        if args.tensorboard and main_proc:
-            tensorboard_logger.update(epoch, values, model.named_parameters())
+                # Check to ensure valid loss was calculated
+                valid_loss, error = check_loss(loss, loss_value)
+                if valid_loss:
+                    optimizer.zero_grad()
+                    # compute gradient
+                    sbw_time = time.time()
+                    loss.backward()
+                    bw_time.update(time.time() - sbw_time)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
+                    optimizer.step()
+                else:
+                    print(error)
+                    print('Skipping grad update')
+                    loss_value = 0
+
+                avg_loss += loss_value
+                losses.update(loss_value, inputs.size(0))
+
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+                if not args.silent and main_proc:
+                    print('Epoch: [{0}][{1}/{2}]\t'
+                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                          'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                          'Backward {bw_time.val:.3f} ({bw_time.avg:.3f})'
+                          'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
+                        (epoch + 1), (i + 1), len(train_sampler), batch_time=batch_time, data_time=data_time, bw_time=bw_time, loss=losses))
+                if args.checkpoint_per_batch > 0 and i > 0 and (i + 1) % args.checkpoint_per_batch == 0 and main_proc:
+                    file_path = '%s/deepspeech_checkpoint_epoch_%d_iter_%d.pth' % (save_folder, epoch + 1, i + 1)
+                    print("Saving checkpoint model to %s" % file_path)
+                    torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, iteration=i,
+                                                    loss_results=loss_results,
+                                                    wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss),
+                               file_path)
+                del loss, out, float_out
+                prof.step()
+
+            avg_loss /= len(train_sampler)
+
+            epoch_time = time.time() - start_epoch_time
+            print('Training Summary Epoch: [{0}]\t'
+                  'Time taken (s): {epoch_time:.0f}\t'
+                  'Average Loss {loss:.3f}\t'.format(epoch + 1, epoch_time=epoch_time, loss=avg_loss))
+
+            start_iter = 0  # Reset start iteration for next epoch
+            with torch.no_grad():
+                wer, cer, output_data = evaluate(test_loader=test_loader,
+                                                 model=model,
+                                                 decoder=decoder,
+                                                 target_decoder=decoder)
+            loss_results[epoch] = avg_loss
+            wer_results[epoch] = wer
+            cer_results[epoch] = cer
+            print('Validation Summary Epoch: [{0}]\t'
+                  'Average WER {wer:.3f}\t'
+                  'Average CER {cer:.3f}\t'.format(
+                epoch + 1, wer=wer, cer=cer))
+
             values = {
-                'Avg Train Loss': avg_loss,
-                'Avg WER': wer,
-                'Avg CER': cer
+                'loss_results': loss_results,
+                'cer_results': cer_results,
+                'wer_results': wer_results
             }
+            if args.visdom and main_proc:
+                visdom_logger.update(epoch, values)
+            if args.tensorboard and main_proc:
+                tensorboard_logger.update(epoch, values, model.named_parameters())
+                values = {
+                    'Avg Train Loss': avg_loss,
+                    'Avg WER': wer,
+                    'Avg CER': cer
+                }
 
-        if main_proc and args.checkpoint:
-            file_path = '%s/deepspeech_%d.pth.tar' % (save_folder, epoch + 1)
-            torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results),
-                       file_path)
-        # anneal lr
-        for g in optimizer.param_groups:
-            g['lr'] = g['lr'] / args.learning_anneal
-        print('Learning rate annealed to: {lr:.6f}'.format(lr=g['lr']))
+            if main_proc and args.checkpoint:
+                file_path = '%s/deepspeech_%d.pth.tar' % (save_folder, epoch + 1)
+                torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
+                                                wer_results=wer_results, cer_results=cer_results),
+                           file_path)
+            # anneal lr
+            for g in optimizer.param_groups:
+                g['lr'] = g['lr'] / args.learning_anneal
+            print('Learning rate annealed to: {lr:.6f}'.format(lr=g['lr']))
 
-        if main_proc and (best_wer is None or best_wer > wer):
-            print("Found better validated model, saving to %s" % args.model_path)
-            torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results)
-                       , args.model_path)
-            best_wer = wer
-            avg_loss = 0
+            if main_proc and (best_wer is None or best_wer > wer):
+                print("Found better validated model, saving to %s" % args.model_path)
+                torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
+                                                wer_results=wer_results, cer_results=cer_results)
+                           , args.model_path)
+                best_wer = wer
+                avg_loss = 0
 
-        if not args.no_shuffle:
-            print("Shuffling batches...")
-            train_sampler.shuffle(epoch)
+            if not args.no_shuffle:
+                print("Shuffling batches...")
+                train_sampler.shuffle(epoch)

@@ -20,16 +20,13 @@ parser.add_argument('--save-output', default=None, help="Saves output of model f
 parser = add_decoder_args(parser)
 
 
-def evaluate(test_loader, device, model, decoder, target_decoder, save_output=False, verbose=False, half=False):
+def evaluate(test_loader, model, decoder, target_decoder, save_output=False, verbose=False):
     model.eval()
     total_cer, total_wer, num_tokens, num_chars = 0, 0, 0, 0
     output_data = []
     for i, (data) in tqdm(enumerate(test_loader), total=len(test_loader)):
         inputs, targets, input_percentages, target_sizes = data
         input_sizes = input_percentages.mul_(int(inputs.size(3))).int()
-        inputs = inputs.to(device)
-        if half:
-            inputs = inputs.half()
         # unflatten targets
         split_targets = []
         offset = 0
@@ -66,8 +63,7 @@ def evaluate(test_loader, device, model, decoder, target_decoder, save_output=Fa
 if __name__ == '__main__':
     args = parser.parse_args()
     torch.set_grad_enabled(False)
-    device = torch.device("cuda" if args.cuda else "cpu")
-    model = load_model(device, args.model_path, args.half)
+    model = load_model(args.model_path)
 
     if args.decoder == "beam":
         from decoder import BeamCTCDecoder
@@ -85,13 +81,11 @@ if __name__ == '__main__':
     test_loader = AudioDataLoader(test_dataset, batch_size=args.batch_size,
                                   num_workers=args.num_workers)
     wer, cer, output_data = evaluate(test_loader=test_loader,
-                                     device=device,
                                      model=model,
                                      decoder=decoder,
                                      target_decoder=target_decoder,
                                      save_output=args.save_output,
-                                     verbose=args.verbose,
-                                     half=args.half)
+                                     verbose=args.verbose)
 
     print('Test Summary \t'
           'Average WER {wer:.3f}\t'
